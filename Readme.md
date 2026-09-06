@@ -10,3 +10,4 @@ https://disk.yandex.ru/d/U-Gto-kt3PAtpQ timeline
 
 https://disk.yandex.ru/d/xESxO6-zthn34Q mftpexplorer
 
+https://disk.yandex.ru/d/rVw_PhopzT9mRw mftecmd
