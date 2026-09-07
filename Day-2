@@ -1,0 +1,207 @@
+### ЭТАП 1. Настройка сети и маршрутизации (Узел: FW01 / OPNsense)
+*Цель: Поднять сегменты, настроить NAT, межсетевой экран (МЭ) и VPN.*
+
+**1.1. Настройка интерфейсов и VLAN/Сетей:**
+1. Зайди в `Interfaces` -> `Assignments`.
+2. Назначь физические/виртуальные интерфейсы под следующие сети (шлюз на FW01 везде `.1`):
+   * **LAB-WAN:** `198.18.10.0/24` (IP FW01: `198.18.10.1`)
+   * **VPN:** `10.8.0.0/24` (IP FW01: `10.8.0.1`)
+   * **USER:** `10.10.10.0/24` (IP FW01: `10.10.10.1`)
+   * **DMZ:** `10.10.20.0/24` (IP FW01: `10.10.20.1`)
+   * **SEC-MGMT:** `10.10.30.0/24` (IP FW01: `10.10.30.1`)
+3. Включи все интерфейсы (`Enable interface`).
+
+**1.2. Настройка NAT:**
+1. Перейди в `Firewall` -> `NAT` -> `Outbound`.
+2. Выбери `Hybrid Outbound NAT rule generation` или `Manual`.
+3. Создай правило: Source `USER network`, `DMZ network`, `VPN network` -> Destination `LAB-WAN net` -> Translation: `Interface Address` (маскарад под WAN IP).
+4. Создай правило Port Forward (`Firewall` -> `NAT` -> `Port Forward`): 
+   * Interface: `LAB-WAN`
+   * Protocol: `TCP`
+   * Destination: `198.18.10.100` port `443` (или 80)
+   * Redirect target IP: `10.10.20.10` (RED-WEB)
+   * Redirect target port: `443`
+
+**1.3. Настройка правил Firewall (Матрица доступа):**
+*Переходи в `Firewall` -> `Rules` для каждого интерфейса. Правило "Default Deny" должно быть внизу.*
+
+*   **Интерфейс LAB-WAN:**
+    *   Allow TCP/UDP from `any` to `10.8.0.1` port `1194` (или твой порт OpenVPN).
+    *   Allow TCP from `any` to `198.18.10.100` port `443` (VIP для RED-WEB).
+    *   Block all остальное.
+*   **Интерфейс VPN:**
+    *   Allow from `vpn-user` alias to `10.10.20.10` (RED-WEB) port `443`.
+    *   Allow from `vpn-admin` alias to `10.10.10.0/24`, `10.10.20.0/24`, `10.10.30.0/24` (порты администрирования: 3389, 8080, 22 и т.д.).
+    *   Block all из VPN в любые другие сети.
+*   **Интерфейс USER:**
+    *   Allow from `10.10.10.10` (WIN-ARM) to `10.10.30.10` (WIN-DC) порты AD/DNS (53, 88, 135, 389, 445, 464, 636, 3268, 3269, 49152-65535 TCP/UDP).
+    *   Allow from `10.10.10.10` (WIN-ARM) to `10.10.30.15` (WIN-KSC) порты KSC (13000 TCP/UDP, 15000 UDP, 8061 TCP).
+    *   Allow from `10.10.10.0/24` to `10.10.30.30` (WAZUH) port `1514` TCP.
+    *   Allow DNS/NTP (53, 123) to `10.10.30.10` (WIN-DC).
+    *   Allow Outbound to Internet (через LAB-WAN).
+    *   Block доступ к `10.10.30.0/24` (кроме разрешенного выше).
+*   **Интерфейс DMZ:**
+    *   Allow from `10.10.20.10` (RED-WEB) to `10.10.30.30` (WAZUH) port `1514` TCP.
+    *   Allow DNS/NTP to `10.10.30.10`.
+    *   Block всё остальное (особенно в USER и SEC-MGMT).
+*   **Интерфейс SEC-MGMT:**
+    *   Allow from `10.10.30.15` (WIN-KSC) to `10.10.10.10` (WIN-ARM) port `15000` UDP (сигналы управления).
+    *   Allow from `10.10.30.20` (RED-OBS) to `10.10.10.0/24` и `10.10.20.0/24` ports `9100`, `9182` (опрос экспортеров).
+    *   Allow от агентов (USER/DMZ) на `10.10.30.30` (WAZUH) port `1515` TCP (enrollment).
+    *   Allow от RED-OBS на WIN-KSC port `13296` TCP (Prometheus metrics).
+
+**1.4. Настройка OpenVPN и CRL (Профили):**
+1. `VPN` -> `OpenVPN` -> `Servers`: Создай сервер (Tunnel IPv4), укажи сеть `10.8.0.0/24`.
+2. `System` -> `Cert. Manager` -> `Certificate Revocation`: Создай CRL.
+3. Для `vpn-revoked`: зайди в сертификаты клиента, нажми `Revoke`, выбери созданный CRL.
+4. В настройках OpenVPN сервера укажи использовать этот CRL для проверки клиентов.
+
+**1.5. Настройка IPS (Предотвращение вторжений):**
+1. `Services` -> `Intrusion Detection` -> `Settings`.
+2. Включи `Enable Intrusion Detection`.
+3. Поставь галочку `IPS Mode` (чтобы блокировал, а не просто алертил).
+4. Выбери интерфейс `LAB-WAN` (или тот, куда смотрит EXT-TEST).
+5. В `Categories` или `Rules` включи правила, детектирующие тестовый шаблон (обычно это правила Emerging Threats или специфичный SID, который нужно найти в тестах `/opt/rtk/tests/ips_control.sh` на EXT-TEST).
+
+---
+
+### ЭТАП 2. Настройка Active Directory (Узел: WIN-DC)
+*Цель: Поднять домен, настроить DNS, NTP и OU.*
+
+1. **Роль AD DS:**
+   * Server Manager -> Add Roles -> Active Directory Domain Services.
+   * Promote this server to a domain controller -> Add a new forest -> Root domain name: `lab.local` (или какое указано в карточке).
+2. **DNS:**
+   * Убедись, что роль DNS установлена.
+   * В DNS Manager создай Forward Lookup Zone для `lab.local`.
+   * Убедись, что WIN-DC слушает запросы на `127.0.0.1` и `10.10.30.10`.
+3. **NTP (Время):**
+   * Открой CMD от Админа:
+     ```cmd
+     w32tm /config /manualpeerlist:"0.pool.ntp.org,0x1 1.pool.ntp.org,0x1" /syncfromflags:manual /reliable:yes /update
+     net stop w32time && net start w32time
+     w32tm /resync
+     ```
+4. **Структура OU и Группы:**
+   * Открой `Active Directory Users and Computers` (dsa.msc).
+   * Создай OU: `ARM-Computers`, `Admins`, `Users`.
+   * Перемести компьютер `WIN-ARM` в OU `ARM-Computers`.
+   * Создай группы безопасности: `KSC-Admins`, `VPN-Users`, `VPN-Admins`.
+
+---
+
+### ЭТАП 3. Настройка Kaspersky Security Center (Узел: WIN-KSC)
+*Цель: Интеграция с AD, политики KES, Network Agent, Application Control, Device Control.*
+
+**3.1. Базовая настройка и AD:**
+1. Открой KSC Console.
+2. `Advanced` -> `Authentication services` -> Добавь сервер Active Directory (`10.10.30.10`), укажи учетку админа домена.
+3. Синхронизируй пользователей и группы.
+
+**3.2. Установка Network Agent и KES на WIN-ARM:**
+1. В KSC создай задачу установки: `Tasks` -> `New Task` -> `Remote installation`.
+2. Выбери пакеты: `Network Agent` и `Kaspersky Endpoint Security`.
+3. В качестве целевых устройств выбери OU `ARM-Computers` или конкретно IP `10.10.10.10`.
+4. Запусти задачу. Дождись появления WIN-ARM в группе `Managed devices`.
+
+**3.3. Настройка Политики KES (Target Policy):**
+1. Перейди в `Policies` -> `Kaspersky Endpoint Security` -> Properties.
+2. **Application Control:**
+   * Включи компонент.
+   * Режим: `Block unknown` или настрой правила так, чтобы штатное ПО (браузер, офис) было в `Trusted`, а тестовый вредоносный exe (который будешь запускать на WIN-ARM) попадал в `Disallowed` или `Low Restricted`.
+3. **Network Threat Protection:**
+   * Включи компонент. Он должен блокировать сетевые атаки (например, сканирование портов или эксплойты, которые пойдут с EXT-TEST).
+4. **Device Control (Контроль устройств):**
+   * Перейди в `Device Control`.
+   * Правило для USB: 
+     * Тип: `Removable drives`.
+     * Действие по умолчанию: `Read-only` (Чтение разрешено, запись запрещена - как в ТЗ для "Обычный").
+     * Добавь исключение (Exception) для конкретного HWID "Доверенного" USB -> Действие: `Allow` (Чтение и запись).
+5. **Применение политики:**
+   * Убедись, что политика применяется к группе, где лежит WIN-ARM.
+   * Статус политики должен быть зеленым (Active/Applied).
+
+---
+
+### ЭТАП 4. Настройка Wazuh и Мониторинга (Узлы: WAZUH, RED-OBS)
+*Цель: Агенты, FIM (File Integrity Monitoring), правила корреляции, Grafana/Prometheus/Loki.*
+
+**4.1. Wazuh Server (Узел: WAZUH - 10.10.30.30):**
+1. **Регистрация агентов:**
+   * Агенты на WIN-ARM и RED-WEB должны быть установлены и подключены к `10.10.30.30:1514`.
+   * Статус в консоли Wazuh должен быть `Active`.
+2. **FIM (Syscheck) - Файловый мониторинг:**
+   * Открой конфиг агента Windows (WIN-ARM) через KSC или локально `C:\Program Files (x86)\ossec-agent\ossec.conf`.
+   * Добавь мониторинг папки `C:\Critical`:
+     ```xml
+     <syscheck>
+       <directories check_all="yes" report_changes="yes">C:\Critical</directories>
+     </syscheck>
+     ```
+   * Перезапусти службу агента Wazuh на WIN-ARM.
+3. **Правила (Rules) и Декодирование:**
+   * На сервере Wazuh (`/var/ossec/etc/rules/local_rules.xml`) создай правила для алертов:
+     * **FIM Alert:** Срабатывает при `Event ID 554` (file added), `550` (modified), `553` (deleted) для пути `C:\Critical`. Уровень (level) >= 7.
+     * **Критичная выгрузка (Data Exfiltration):** Срабатывает, если в логах есть события с `sensitivity=critical` И `record_count >= 100`.
+     * **Компрометация учетки:** 
+       ```xml
+       <!-- 5 событий 4625 (Logon failure) за 2 минуты -->
+       <rule id="100002" level="10" frequency="5" timeframe="120">
+         <if_matched_sid>60106</if_matched_sid> <!-- 60106 это mapped 4625 в Wazuh -->
+         <description>Multiple logon failures (possible brute force).</description>
+       </rule>
+       
+       <!-- Затем 4624 (Logon success) от того же пользователя/IP за 5 минут -->
+       <rule id="100003" level="12" frequency="1" timeframe="300" match="4624">
+         <if_matched_sid>100002</if_matched_sid>
+         <description>Account compromise: Brute force followed by successful logon.</description>
+       </rule>
+       ```
+   * Перезапусти Wazuh Manager: `systemctl restart wazuh-manager`.
+
+**4.2. Мониторинг (Узел: RED-OBS - 10.10.30.20):**
+1. **Prometheus (`/etc/prometheus/prometheus.yml`):**
+   * Добавь targets для сбора метрик:
+     ```yaml
+     scrape_configs:
+       - job_name: 'wazuh'
+         static_configs:
+           - targets: ['10.10.30.30:9100'] # Wazuh exporter
+       - job_name: 'windows'
+         static_configs:
+           - targets: ['10.10.10.10:9182'] # WIN-ARM exporter
+       - job_name: 'blackbox_ping'
+         metrics_path: /probe
+         params:
+           module: [icmp]
+         static_configs:
+           - targets: ['10.10.10.10', '10.10.20.10', '10.10.30.10'] # Пинг узлов
+         relabel_configs:
+           - source_labels: [__address__]
+             target_label: __param_target
+           - source_labels: [__param_target]
+             target_label: instance
+           - target_label: __address__
+             replacement: 127.0.0.1:9115 # Blackbox exporter
+     ```
+   * `systemctl restart prometheus`.
+2. **Alloy / Loki (`/etc/alloy/config.alloy`):**
+   * Настрой сбор логов с WIN-ARM и RED-WEB (если они шлются по syslog/tcp) и отправку в Loki (`http://localhost:3100/loki/api/v1/push`).
+   * Убедись, что Alloy слушает порт `3100` (или какой указан) и форвардит в Loki.
+3. **Grafana (`http://10.10.30.20:3000`):**
+   * Добавь Data Sources: Prometheus (`http://localhost:9090`), Loki (`http://localhost:3100`).
+   * Импортируй дашборды для мониторинга узлов и алертов Wazuh.
+
+---
+
+### ЭТАП 5. Финальная проверка (Чек-лист соответствия ТЗ)
+
+1. **Сеть:** С WIN-ARM пингуется интернет? Пингуется WIN-DC? Не пингуется/не доступен RDP на WIN-KSC напрямую без правил?
+2. **VPN:** Подключается `vpn-user`? Видит ли только RED-WEB? Подключается `vpn-admin`? Видит ли всё? Отклоняется ли `vpn-revoked` (проверь логи OpenVPN на FW01)?
+3. **IPS:** Запусти `/opt/rtk/tests/ips_control.sh` на EXT-TEST. Блокируется ли трафик на FW01? (Смотри `Firewall` -> `Logs` -> `Alerts` на OPNsense).
+4. **KSC:** На WIN-ARM вставь обычную флешку -> можно прочитать, нельзя записать. Вставь доверенную (с нужным HWID) -> можно записать. Запусти "запрещенный" exe -> Application Control блокирует.
+5. **Wazuh FIM:** Создай/измени/удали файл в `C:\Critical` на WIN-ARM. Пришел ли алерт в Wazuh Dashboard?
+6. **Wazuh Correlation:** Набей 5 раз неверный пароль (RDP/SMB) на WIN-ARM, затем введи верный. Сгенерировался ли единый алерт компрометации в Wazuh?
+7. **Мониторинг:** В Grafana горят ли зеленым дашборды? Опрашивается ли Blackbox?
+
+*Все изменения делай последовательно. После каждого крупного блока (Сеть -> AD -> KSC -> Wazuh) фиксируй состояние снапшотами (если разрешено) или просто проверяй работоспособность, так как откат без команды эксперта запрещен.*
